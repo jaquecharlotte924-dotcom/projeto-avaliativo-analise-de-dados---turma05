@@ -1,236 +1,202 @@
 
 import pandas as pd
-from datetime import datetime, time
 from sqlalchemy import text
 from banco import engine
 
-
-def converter_valor(valor):
-    if pd.isna(valor):
-        return None
-
-    valor = str(valor).strip()
-
-    if valor == "" or valor.lower() in ["nan", "none"]:
-        return None
-
-    if "," in valor:
-        valor = valor.replace(".", "").replace(",", ".")
-
-    return valor
+LOTE = 5000
 
 
-def converter_horario(valor):
-    if pd.isna(valor):
-        return None
-
-    if isinstance(valor, time):
-        return valor
-
-    valor = str(valor).strip()
-
-    if not valor or valor.lower() in ["nan", "none"]:
-        return None
-
-    for formato in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
-        try:
-            return datetime.strptime(valor, formato).time()
-        except ValueError:
-            continue
-
-    return None
+def limpar(s, limite=None):
+    s = s.astype("string").str.strip()
+    s = s.mask(s.str.lower().isin(["", "nan", "none", "null"]))
+    if limite:
+        s = s.str.slice(0, limite)
+    return s.astype(object).where(s.notna(), None)
 
 
-def transformar_tabela(tabela):
-    print(f"\nTransformando {tabela}...", flush=True)
+def numero(s):
+    s = limpar(s).astype("string")
+    s = s.str.replace("R$", "", regex=False).str.replace(" ", "", regex=False)
+    virgula = s.str.contains(",", na=False)
+    s.loc[virgula] = (
+        s.loc[virgula].str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    n = pd.to_numeric(s, errors="coerce")
+    return n.astype(object).where(n.notna(), None)
 
-    # Lê os dados da camada RAW
-    df = pd.read_sql(f'SELECT * FROM raw."{tabela}"', engine)
 
-    # Consulta a estrutura da tabela SILVER
-    consulta = text("""
-        SELECT column_name, data_type, is_identity, is_nullable
-        FROM information_schema.columns
-        WHERE table_schema = 'silver'
-          AND table_name = :tabela
-        ORDER BY ordinal_position
-    """)
+def data(s):
+    d = pd.to_datetime(s, dayfirst=True, errors="coerce")
+    return pd.Series(d.dt.date, index=s.index, dtype=object).where(d.notna(), None)
 
-    with engine.connect() as conn:
-        colunas_silver = pd.read_sql(
-            consulta, conn, params={"tabela": tabela}
+
+def inserir(tabela, df, conn):
+    if not df.empty:
+        df.to_sql(
+            tabela, conn, schema="public",
+            if_exists="append", index=False, chunksize=1000
         )
 
-    # Exclui as colunas geradas automaticamente
-    colunas_identidade = colunas_silver.loc[
-        colunas_silver["is_identity"] == "YES",
-        "column_name"
-    ].tolist()
 
-    df = df.drop(columns=colunas_identidade, errors="ignore")
+def viagens(conn):
+    ids = set()
+    total = 0
 
-    # Converte os dados conforme os tipos do PostgreSQL
-    for _, coluna in colunas_silver.iterrows():
-        nome = coluna["column_name"]
-        tipo = coluna["data_type"]
+    for r in pd.read_sql_query(
+        "SELECT * FROM public.raw_viagem", conn, chunksize=LOTE
+    ):
+        inicio = pd.to_datetime(r["data_inicio"], dayfirst=True, errors="coerce")
+        fim = pd.to_datetime(r["data_fim"], dayfirst=True, errors="coerce")
+        dias = (fim - inicio).dt.days + 1
 
-        if nome not in df.columns:
-            continue
+        df = pd.DataFrame({
+            "id_viagem": limpar(r["identificador_processo_viagem"], 20),
+            "num_proposta": limpar(r["numero_proposta_pcdp"], 20),
+            "situacao": limpar(r["situacao"], 50),
+            "viagem_urgente": limpar(r["viagem_urgente"], 5),
+            "cod_orgao_super": limpar(r["codigo_orgao_superior"], 20),
+            "nome_orgao_superior": limpar(r["nome_orgao_superior"], 255),
+            "nome_viajante": limpar(r["nome"], 255),
+            "cargo": limpar(r["cargo"], 255),
+            "data_inicio": data(r["data_inicio"]),
+            "data_fim": data(r["data_fim"]),
+            "destinos": limpar(r["destinos"], 400),
+            "motivo": limpar(r["motivo"], 400),
+            "valor_diarias": numero(r["valor_diarias"]),
+            "valor_passagens": numero(r["valor_passagens"]),
+            "valor_devolucao": numero(r["valor_devolucao"]),
+            "valor_outros_gastos": numero(r["valor_outros_gastos"]),
+            "duracao_dias": [
+                int(v) if pd.notna(v) and v > 0 else None
+                for v in dias
+            ]
+        })
 
-        if tipo in ["bigint", "integer", "smallint"]:
-            df[nome] = pd.to_numeric(
-                df[nome], errors="coerce"
-            ).astype("Int64")
+        df["nome_orgao_superior"] = df["nome_orgao_superior"].fillna("Sem informação")
+        df = df.dropna(subset=["id_viagem"])
+        df = df.drop_duplicates(subset=["id_viagem"])
+        df = df[~df["id_viagem"].isin(ids)].copy()
 
-        elif tipo in ["numeric", "decimal", "real", "double precision"]:
-            df[nome] = df[nome].apply(converter_valor)
-            df[nome] = pd.to_numeric(
-                df[nome], errors="coerce"
-            )
+        diarias = pd.to_numeric(df["valor_diarias"], errors="coerce")
+        df = df[diarias.isna() | (diarias >= 0)].copy()
 
-        elif tipo.startswith("time"):
-            df[nome] = df[nome].apply(converter_horario)
+        df["valor_total"] = (
+            pd.to_numeric(df["valor_diarias"], errors="coerce").fillna(0)
+            + pd.to_numeric(df["valor_passagens"], errors="coerce").fillna(0)
+            + pd.to_numeric(df["valor_outros_gastos"], errors="coerce").fillna(0)
+            - pd.to_numeric(df["valor_devolucao"], errors="coerce").fillna(0)
+        ).round(2)
 
-        elif tipo == "date" or "timestamp" in tipo:
-            df[nome] = pd.to_datetime(
-                df[nome], dayfirst=True, errors="coerce"
-            )
+        ids.update(df["id_viagem"])
+        inserir("silver_viagem", df, conn)
+        total += len(df)
 
-    # Remove linhas sem os campos obrigatórios
-    obrigatorias = colunas_silver.loc[
-        (colunas_silver["is_nullable"] == "NO")
-        & (colunas_silver["is_identity"] != "YES"),
-        "column_name"
-    ].tolist()
+    print(f"Viagens: {total}")
+    return ids
 
-    obrigatorias = [c for c in obrigatorias if c in df.columns]
 
-    if obrigatorias:
-        df = df.dropna(subset=obrigatorias)
+def dependente(conn, tabela_raw, tabela_silver, transformar, ids):
+    total = 0
+    chaves_trecho = set()
 
-    # Mantém apenas viagens que existem na SILVER
-    if tabela in ["pagamento", "passagem", "trecho"]:
-        campo = "identificador_processo_viagem"
+    for r in pd.read_sql_query(
+        f"SELECT * FROM public.{tabela_raw}", conn, chunksize=LOTE
+    ):
+        df = transformar(r)
+        df = df[df["id_viagem"].isin(ids)].copy()
 
-        if campo in df.columns:
-            ids_viagem = pd.read_sql(
-                f'SELECT "{campo}" FROM silver.viagem',
-                engine
-            )
+        if tabela_silver == "silver_trecho":
+            manter = []
+            for idv, seq in zip(df["id_viagem"], df["sequencia_trecho"]):
+                chave = (idv, seq)
+                ok = pd.isna(seq) or chave not in chaves_trecho
+                manter.append(ok)
+                if pd.notna(seq):
+                    chaves_trecho.add(chave)
+            df = df.loc[manter].copy()
 
-            df = df[df[campo].isin(ids_viagem[campo])]
+        inserir(tabela_silver, df, conn)
+        total += len(df)
 
-    # Mantém apenas as colunas existentes no destino
-    colunas_validas = [
-        c for c in colunas_silver["column_name"]
-        if c in df.columns
-    ]
+    print(f"{tabela_silver}: {total}")
 
-    df = df[colunas_validas]
 
-    # Cria tabela temporária para preparar a inserção
-    staging = f"stg_{tabela}"
+def pagamentos(r):
+    df = pd.DataFrame({
+        "id_viagem": limpar(r["identificador_processo_viagem"], 20),
+        "num_proposta": limpar(r["numero_proposta_pcdp"], 20),
+        "nome_orgao_pagador": limpar(r["nome_orgao_pagador"], 255),
+        "nome_ug_pagadora": limpar(r["nome_unidade_gestora_pagadora"], 255),
+        "tipo_pagamento": limpar(r["tipo_pagamento"], 50),
+        "valor": numero(r["valor"])
+    })
+    df = df[df["tipo_pagamento"].notna()].copy()
+    v = pd.to_numeric(df["valor"], errors="coerce")
+    return df[v.isna() | (v >= 0)].copy()
 
-    df.to_sql(
-        staging,
-        engine,
-        schema="silver",
-        if_exists="replace",
-        index=False,
-        chunksize=2000,
-        method="multi"
+
+def passagens(r):
+    df = pd.DataFrame({
+        "id_viagem": limpar(r["identificador_processo_viagem"], 20),
+        "meio_transporte": limpar(r["meio_transporte"], 50),
+        "pais_origem_ida": limpar(r["pais_origem_ida"], 60),
+        "uf_origem_ida": limpar(r["uf_origem_ida"], 40),
+        "cidade_origem_ida": limpar(r["cidade_origem_ida"], 80),
+        "pais_destino_ida": limpar(r["pais_destino_ida"], 60),
+        "uf_destino_ida": limpar(r["uf_destino_ida"], 4),
+        "cidade_destino_ida": limpar(r["cidade_destino_ida"], 80),
+        "valor_passagem": numero(r["valor_passagem"]),
+        "taxa_servico": numero(r["taxa_servico"]),
+        "data_emissao": data(r["data_emissao_compra"])
+    })
+    v = pd.to_numeric(df["valor_passagem"], errors="coerce")
+    t = pd.to_numeric(df["taxa_servico"], errors="coerce")
+    return df[(v.isna() | (v >= 0)) & (t.isna() | (t >= 0))].copy()
+
+
+def trechos(r):
+    df = pd.DataFrame({
+        "id_viagem": limpar(r["identificador_processo_viagem"], 20),
+        "sequencia_trecho": pd.to_numeric(
+            r["sequencia_trecho"], errors="coerce"
+        ),
+        "origem_data": data(r["origem_data"]),
+        "origem_uf": limpar(r["origem_uf"], 40),
+        "origem_cidade": limpar(r["origem_cidade"], 80),
+        "destino_data": data(r["destino_data"]),
+        "destino_uf": limpar(r["destino_uf"], 40),
+        "destino_cidade": limpar(r["destino_cidade"], 80),
+        "meio_transporte": limpar(r["meio_transporte"], 50),
+        "numero_diarias": numero(r["numero_diarias"])
+    })
+    df["sequencia_trecho"] = df["sequencia_trecho"].map(
+        lambda v: int(v) if pd.notna(v) and v % 1 == 0 else None
     )
-
-    # Prepara conversões explícitas para o PostgreSQL
-    expressoes = []
-
-    for nome in colunas_validas:
-        tipo = colunas_silver.loc[
-            colunas_silver["column_name"] == nome,
-            "data_type"
-        ].iloc[0]
-
-        coluna_sql = f'"{nome}"'
-
-        if tipo.startswith("time"):
-            expressao = f"NULLIF({coluna_sql}::text, '')::time"
-
-        elif tipo == "date":
-            expressao = f"NULLIF({coluna_sql}::text, '')::date"
-
-        elif "timestamp" in tipo:
-            if "with time zone" in tipo:
-                expressao = (
-                    f"NULLIF({coluna_sql}::text, '')"
-                    "::timestamp with time zone"
-                )
-            else:
-                expressao = (
-                    f"NULLIF({coluna_sql}::text, '')"
-                    "::timestamp without time zone"
-                )
-
-        elif tipo in ["bigint", "integer", "smallint"]:
-            expressao = f"NULLIF({coluna_sql}::text, '')::{tipo}"
-
-        elif tipo in ["numeric", "decimal", "real", "double precision"]:
-            expressao = f"NULLIF({coluna_sql}::text, '')::{tipo}"
-
-        else:
-            expressao = coluna_sql
-
-        expressoes.append(expressao)
-
-    # Insere os dados sem apagar as tabelas ou suas restrições
-    if colunas_validas:
-        colunas_sql = ", ".join(
-            f'"{c}"' for c in colunas_validas
-        )
-        valores_sql = ", ".join(expressoes)
-
-        sql_insert = text(f"""
-            INSERT INTO silver."{tabela}" ({colunas_sql})
-            SELECT {valores_sql}
-            FROM silver."{staging}"
-            ON CONFLICT DO NOTHING
-        """)
-
-        with engine.begin() as conn:
-            conn.execute(sql_insert)
-            conn.execute(
-                text(f'DROP TABLE IF EXISTS silver."{staging}"')
-            )
-    else:
-        with engine.begin() as conn:
-            conn.execute(
-                text(f'DROP TABLE IF EXISTS silver."{staging}"')
-            )
-
-    # Consulta o total inserido
-    with engine.connect() as conn:
-        total = conn.execute(
-            text(f'SELECT COUNT(*) FROM silver."{tabela}"')
-        ).scalar()
-
-    print(
-        f"{tabela}: {total} registros na SILVER.",
-        flush=True
-    )
+    v = pd.to_numeric(df["numero_diarias"], errors="coerce")
+    return df[v.isna() | (v >= 0)].copy()
 
 
-# Limpa a SILVER antes de recarregar os dados da RAW
 with engine.begin() as conn:
     conn.execute(text("""
         TRUNCATE TABLE
-            silver.pagamento,
-            silver.passagem,
-            silver.trecho,
-            silver.viagem
-        RESTART IDENTITY CASCADE
+            public.silver_trecho,
+            public.silver_passagem,
+            public.silver_pagamento,
+            public.silver_viagem
+        RESTART IDENTITY
     """))
 
-# A viagem deve ser carregada antes das tabelas dependentes
-for tabela in ["viagem", "pagamento", "passagem", "trecho"]:
-    transformar_tabela(tabela)
+    print("Transformando viagens...", flush=True)
+    ids = viagens(conn)
 
-print("\nTransformação da camada SILVER concluída!", flush=True)
+    print("Transformando pagamentos...", flush=True)
+    dependente(conn, "raw_pagamento", "silver_pagamento", pagamentos, ids)
+
+    print("Transformando passagens...", flush=True)
+    dependente(conn, "raw_passagem", "silver_passagem", passagens, ids)
+
+    print("Transformando trechos...", flush=True)
+    dependente(conn, "raw_trecho", "silver_trecho", trechos, ids)
+
+print("Transformação SILVER concluída!")
