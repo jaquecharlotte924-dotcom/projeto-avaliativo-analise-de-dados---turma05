@@ -1,4 +1,3 @@
-
 import pandas as pd
 from sqlalchemy import text
 from banco import engine
@@ -61,8 +60,8 @@ def viagens(conn):
             "cargo": limpar(r["cargo"], 255),
             "data_inicio": data(r["data_inicio"]),
             "data_fim": data(r["data_fim"]),
-            "destinos": limpar(r["destinos"], 400),
-            "motivo": limpar(r["motivo"], 400),
+            "destinos": limpar(r["destinos"], 4000),
+            "motivo": limpar(r["motivo"], 4000),
             "valor_diarias": numero(r["valor_diarias"]),
             "valor_passagens": numero(r["valor_passagens"]),
             "valor_devolucao": numero(r["valor_devolucao"]),
@@ -73,7 +72,9 @@ def viagens(conn):
             ]
         })
 
-        df["nome_orgao_superior"] = df["nome_orgao_superior"].fillna("Sem informação")
+        df["nome_orgao_superior"] = df["nome_orgao_superior"].fillna(
+            "Sem informação"
+        )
         df = df.dropna(subset=["id_viagem"])
         df = df.drop_duplicates(subset=["id_viagem"])
         df = df[~df["id_viagem"].isin(ids)].copy()
@@ -144,7 +145,7 @@ def passagens(r):
         "uf_origem_ida": limpar(r["uf_origem_ida"], 40),
         "cidade_origem_ida": limpar(r["cidade_origem_ida"], 80),
         "pais_destino_ida": limpar(r["pais_destino_ida"], 60),
-        "uf_destino_ida": limpar(r["uf_destino_ida"], 4),
+        "uf_destino_ida": limpar(r["uf_destino_ida"], 40),
         "cidade_destino_ida": limpar(r["cidade_destino_ida"], 80),
         "valor_passagem": numero(r["valor_passagem"]),
         "taxa_servico": numero(r["taxa_servico"]),
