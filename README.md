@@ -138,10 +138,10 @@ As conferências realizadas apresentaram os mesmos resultados da base de referê
 Os principais arquivos do projeto são:
 
 - `0_criar_banco.sql`: criação das tabelas RAW e SILVER, chaves e constraints.
+- `0_ajustes_silver.sql`: ajustes realizados na estrutura da camada SILVER.
 - `1_extrair.py`: leitura e carga dos arquivos CSV na camada RAW.
 - `2_transformar.py`: transformação dos dados da RAW para a SILVER.
 - `3_analise.ipynb`: consultas, resultados, gráficos e conclusões das perguntas de negócio.
-- `4_ajustes_silver.sql`: ajustes realizados na estrutura da camada SILVER.
 - `4_gold.sql`: criação das tabelas e views da camada GOLD.
 - `banco.py`: conexão com o PostgreSQL.
 - `config.py`: leitura das configurações do banco.
